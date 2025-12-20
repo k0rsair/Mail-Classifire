@@ -1,0 +1,42 @@
+#Docker Networks
+networks:
+  space_plans_network:
+    driver: bridge
+
+#Volumes
+volumes:
+  dbdata:
+    driver: local
+
+# Workflow
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: ./nginx/Dockerfile
+    container_name: nginx-space-plans
+    ports:
+      - "80:80"
+    volumes:
+      - ./source:/var/www/html:delegated
+    depends_on:
+      - python-space-plans
+    networks:
+      - space_plans_network
+  python-space-plans:
+    build: 
+      context: .
+      dockerfile: ./python/Dockerfile
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./python:/python:delegated
+    networks:
+      - space_plans_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+
