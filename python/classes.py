@@ -5,7 +5,7 @@ from email.parser import BytesParser
 import extract_msg
 from bs4 import BeautifulSoup
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import uuid
 
 URL_REGEX = re.compile(
@@ -305,14 +305,48 @@ class Category:
     examples: Optional[List[str]] = None
 
 class MailClassyfire:
+    def _calculate_adaptive_threshold(self, scores: np.ndarray) -> float:
+        """
+        Вычисляет адаптивный порог на основе распределения scores.
+        Использует среднее значение между максимальным и средним score.
+        """
+        if len(scores) == 0:
+            return 0.3
+        
+        max_score = scores.max()
+        mean_score = scores.mean()
+        std_score = scores.std()
+        
+        # Адаптивный порог: среднее между max и mean, с учетом стандартного отклонения
+        adaptive_threshold = mean_score + 0.5 * (max_score - mean_score)
+        
+        # Ограничиваем диапазоном [0.2, 0.4] для low confidence
+        adaptive_threshold = max(0.2, min(0.4, adaptive_threshold))
+        
+        logger.debug(f"Адаптивный порог: {adaptive_threshold:.4f} (max={max_score:.4f}, mean={mean_score:.4f}, std={std_score:.4f})")
+        return adaptive_threshold
+    
+    def _get_confidence_level(self, score: float, threshold: float) -> str:
+        """
+        Определяет уровень уверенности на основе score и порога.
+        """
+        if score >= threshold:
+            return "high"
+        elif score >= threshold * 0.7:  # 70% от порога
+            return "medium"
+        elif score >= 0.2:
+            return "low"
+        else:
+            return "very_low"
+    
     def classify_email(
             self,
             email_text: str,
             categories: List[Any],
             embedder: EmbeddingService,
             file_name : str,
-            threshold: float = 0.45,
-            top_n: int = 5
+            threshold: Optional[float] = None,
+            top_n: int = 3
     ) -> Dict[str, Any]:
         logger.info(f"Начинаем классификацию email (длина: {len(email_text)} символов)")
         logger.debug(f"Параметры классификации: threshold={threshold}, top_n={top_n}")
@@ -339,32 +373,64 @@ class MailClassyfire:
             if logger.level("DEBUG").no <= logger._core.min_level:
                 logger.debug(
                     f"Статистика scores: min={scores.min():.4f}, "f"max={scores.max():.4f}, mean={scores.mean():.4f}")
+            
+            # Сортируем по убыванию score
             ranked = sorted(zip(names, scores), key=lambda x: x[1], reverse=True)
-            top_scores = [{"category": n, "score": float(s)} for n, s in ranked[:top_n]]
+            
+            # Используем адаптивный порог, если не указан явно
+            if threshold is None:
+                threshold = self._calculate_adaptive_threshold(scores)
+            
+            # Берем топ-3 категории
+            top_3 = ranked[:min(3, len(ranked))]
+            top_scores = [
+                {
+                    "category": n, 
+                    "score": float(s),
+                    "rank": idx + 1,
+                    "confidence": self._get_confidence_level(float(s), threshold)
+                } 
+                for idx, (n, s) in enumerate(top_3)
+            ]
 
             best_cat, best_score = ranked[0]
+            confidence_level = self._get_confidence_level(float(best_score), threshold)
             is_undefined = best_score < threshold
+
+            # Вычисляем метрику confidence (нормализованный score от 0 до 1)
+            # Используем сигмоиду для нормализации
+            confidence_metric = 1 / (1 + np.exp(-5 * (best_score - threshold)))
+            
+            # Альтернативная метрика: процент от максимально возможного
+            max_possible_score = 1.0
+            confidence_percentage = (best_score / max_possible_score) * 100
 
             result = {
                 "predicted_category": "Не определена" if is_undefined else best_cat,
                 "is_undefined": bool(is_undefined),
                 "best_score": float(best_score),
-                "scores": top_scores,
+                "confidence_level": confidence_level,
+                "confidence_metric": float(confidence_metric),
+                "confidence_percentage": float(confidence_percentage),
+                "threshold_used": float(threshold),
+                "top_3_categories": top_scores,
+                "scores": top_scores,  # Для обратной совместимости
                 "file_name": file_name
             }
 
             if is_undefined:
                 logger.warning(
                     f"Категория не определена. Лучший результат: '{best_cat}' "
-                    f"с score={best_score:.4f} (ниже порога {threshold})"
+                    f"с score={best_score:.4f} (ниже порога {threshold:.4f}), confidence={confidence_level}"
                 )
             else:
                 logger.info(
-                    f"Определена категория: '{best_cat}' с score={best_score:.4f} (порог: {threshold})"
+                    f"Определена категория: '{best_cat}' с score={best_score:.4f} "
+                    f"(порог: {threshold:.4f}), confidence={confidence_level}"
                 )
 
-            logger.debug(f"Топ-{top_n} категорий: {top_scores}")
-            logger.debug(f"Лучшая категория: {best_cat}, score: {best_score:.4f}")
+            logger.debug(f"Топ-3 категорий: {top_scores}")
+            logger.debug(f"Лучшая категория: {best_cat}, score: {best_score:.4f}, confidence: {confidence_metric:.4f}")
             logger.success(f"Классификация завершена успешно")
             return result
         except ValueError as ve:
